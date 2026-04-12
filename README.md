@@ -38,12 +38,12 @@ This stick uses a software-emulated EEPROM over I2C. When the UDM Pro Max polls 
 
 ## Step 1 — Extract Certificates from BGW320-500
 
-Follow the [certs extraction guide](https://github.com/0x888e/certs) to extract the EAP-TLS certificates from your BGW320-500. You will need:
-
+Follow the [certs extraction guide](https://github.com/0x888e/certs) to extract the EAP-TLS certificates from your BGW320-500. The repo includes a script that automates the extraction process. You will need:
+ 
 - `ca.pem` — AT&T root CA
 - `client.pem` — client certificate
 - `client.key` — client private key
-
+ 
 Copy these to `/etc/wpa_supplicant/` on the UDM Pro Max.
 
 ---
@@ -88,6 +88,8 @@ reboot
 ---
 
 ## Step 3 — Configure wpa_supplicant on UDM Pro Max
+
+Follow the [Unifi-gateway-wpa-supplicant guide by Evie Lau](https://github.com/evie-lau/unifi-gateway-wpa-supplicant) for full details on the wpa_supplicant service setup. The key difference when using the DFP-34X-2C2 on UniFi hardware is using `eth9.0` instead of `eth9` — covered in Step 4.
 
 Create the wpa_supplicant config at `/etc/wpa_supplicant/wpa_supplicant-wired-eth9.0.conf`:
 
