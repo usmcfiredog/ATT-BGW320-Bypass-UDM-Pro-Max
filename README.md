@@ -63,6 +63,8 @@ ssh -oKexAlgorithms=+diffie-hellman-group1-sha1 \
     admin@192.168.1.1
 ```
 
+> **PuTTY users:** The flags above are OpenSSH command-line options and won't work directly in PuTTY. Instead, enable the equivalent settings in PuTTY's GUI: **Connection → SSH → Kex** (move `Diffie-Hellman group 1` to the top), **Connection → SSH → Cipher** (enable `3DES`), and **Connection → SSH → Host Keys** (enable `RSA`). Windows users on OpenSSH (PowerShell/CMD) can use the command above as-is.
+
 Configure the stick to impersonate your BGW320-500:
 
 ```
@@ -122,9 +124,6 @@ wget http://ftp.us.debian.org/debian/pool/main/p/pcsc-lite/libpcsclite1_1.9.1-1_
 From the machine with your extracted certs:
 
 ```bash
-# Create the directory on the UDM first
-ssh root@<UDM_IP> "mkdir -p /etc/wpa_supplicant"
-
 # Copy certs (rename as you go)
 scp CA_<serial>.pem         root@<UDM_IP>:/etc/wpa_supplicant/ca.pem
 scp Client_<serial>.pem     root@<UDM_IP>:/etc/wpa_supplicant/client.pem
@@ -134,7 +133,9 @@ scp PrivateKey_PKCS1_<serial>.pem root@<UDM_IP>:/etc/wpa_supplicant/client.key
 ssh root@<UDM_IP> "chmod 600 /etc/wpa_supplicant/*.pem /etc/wpa_supplicant/*.key"
 ```
 
-Back on the UDM, create the wpa_supplicant config:
+> **Windows users:** The `ssh` and `scp` commands above work natively in PowerShell and Command Prompt on Windows 10 (1809+) and Windows 11 — no PuTTY required. If OpenSSH Client isn't installed, go to **Settings → System → Optional Features** and add it. PuTTY users will need to run the `chmod` command interactively in their SSH session and use `pscp` instead of `scp` for the file transfers.
+
+In your UDM SSH session, create the wpa_supplicant config file:
 
 ```bash
 cat > /etc/wpa_supplicant/wpa_supplicant-wired-eth9.0.conf << 'EOF'
