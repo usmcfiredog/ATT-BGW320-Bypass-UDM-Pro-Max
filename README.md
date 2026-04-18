@@ -96,7 +96,7 @@ reboot
 
 ## Step 3 — Install wpasupplicant on UDM Pro Max
 
-UniFi OS does not include `wpasupplicant` by default. Install it via apt **while you still have working internet** (through the BGW, before cutover), and cache the `.deb` files in a persistent location so the `reinstall-wpa.service` (Step 9) can reinstall after firmware updates wipe `/sbin/wpa_supplicant`.
+UniFi OS does not include `wpasupplicant` by default. Install it via apt **while you still have working internet** (through the BGW, before cutover), and cache the `.deb` files in a persistent location so the `reinstall-wpa.service` (Step 10) can reinstall after firmware updates wipe `/sbin/wpa_supplicant`.
 
 SSH into your UDM:
 
@@ -218,7 +218,7 @@ systemctl daemon-reload
 systemctl enable on-boot.service
 ```
 
-This service runs the scripts in `/data/on_boot.d/` at every boot, in filename (numeric) order. Steps 7 and 8 depend on it.
+This service runs the scripts in `/data/on_boot.d/` at every boot, in filename (numeric) order. Steps 7, 8, and 9 depend on it.
 
 ---
 
@@ -284,7 +284,76 @@ After applying, the stick is reachable at `http://192.168.1.1` and via SSH from 
 
 ---
 
-## Step 9 — Firmware-update survival service
+## Step 9 — ONU Management IP Watchdog
+
+UniFi OS's `ubios-udapi-server` occasionally restarts and flushes interface state, which can cause the `192.168.1.2` alias and iptables SNAT rule created in Step 8 to disappear between reboots. This watchdog detects and restores them automatically every minute.
+
+Create the watchdog script:
+
+```bash
+cat > /usr/local/bin/eth9-watchdog.sh << 'EOF'
+#!/bin/sh
+# Watchdog: restore eth9 ONU management IP and iptables SNAT rule if missing
+
+LOGFILE="/var/log/eth9-watchdog.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOGFILE"
+}
+
+# Check and restore the 192.168.1.2 alias
+if ! ip addr show eth9 | grep -q '192.168.1.2'; then
+    log "192.168.1.2 missing from eth9 — restoring alias and SNAT rule"
+    ifconfig eth9:2 192.168.1.2 netmask 255.255.255.0 up 2>/dev/null
+    if ! iptables -w -t nat -C POSTROUTING -o eth9 -d 192.168.1.1 -j SNAT --to 192.168.1.2 2>/dev/null; then
+        iptables -w -t nat -A POSTROUTING -o eth9 -d 192.168.1.1 -j SNAT --to 192.168.1.2
+    fi
+    log "Restored 192.168.1.2 alias and SNAT rule on eth9"
+fi
+EOF
+chmod +x /usr/local/bin/eth9-watchdog.sh
+```
+
+Set up the persistent cron entry. UniFi OS does not persist `crontab -e` across reboots — cron state must be stored in `/data/crontabs/root` and reloaded at boot:
+
+```bash
+mkdir -p /data/crontabs
+
+cat > /data/crontabs/root << 'EOF'
+* * * * * /usr/local/bin/eth9-watchdog.sh
+EOF
+
+chmod 600 /data/crontabs/root
+crontab /data/crontabs/root
+
+# Verify it loaded
+crontab -l
+```
+
+Create the boot script to restore cron on every reboot:
+
+```bash
+cat > /data/on_boot.d/30-cron.sh << 'EOF'
+#!/bin/sh
+# Restore persistent crontab on boot
+if [ -f /data/crontabs/root ]; then
+    crontab /data/crontabs/root
+fi
+EOF
+chmod +x /data/on_boot.d/30-cron.sh
+```
+
+After a minute, verify the watchdog is firing correctly (no output means the alias is present and healthy):
+
+```bash
+grep eth9-watchdog /var/log/eth9-watchdog.log
+```
+
+> **Graylog / syslog users:** The watchdog logs to `/var/log/eth9-watchdog.log`. If you want a syslog-visible alert for Graylog, add `| logger -t eth9-watchdog` to the `log()` function's `echo` command.
+
+---
+
+## Step 10 — Firmware-update survival service
 
 UniFi firmware updates wipe `apt`-installed packages including `wpasupplicant`. This service detects the missing binary on boot and reinstalls from the `.deb` files cached in Step 3.
 
@@ -321,7 +390,7 @@ systemctl enable reinstall-wpa.service
 
 ---
 
-## Step 10 — Configure UniFi WAN for VLAN 962
+## Step 11 — Configure UniFi WAN for VLAN 962
 
 In the UniFi dashboard, navigate to **Settings → Internet** and configure the SFP+ WAN (physical port `eth9`):
 
@@ -336,7 +405,7 @@ Apply the change. WAN will be offline until you complete the fiber swap below.
 
 ---
 
-## Step 11 — Fiber Swap
+## Step 12 — Fiber Swap
 
 1. Unplug fiber from the BGW320. **Wait 30–60 seconds** for AT&T's OLT to drop the BGW's registration — skipping this step causes dual-registration flapping with cloned credentials.
 2. Insert the DFP-34X-2C2 into the UDM SFP+ port (`eth9`).
@@ -369,6 +438,9 @@ systemctl is-active wpa_supplicant-wired@eth9.0
 ip -br addr show eth9.0        # UP, LOWER_UP
 ip -br addr show eth9.962      # has public IPv4 + IPv6
 ip addr show eth9 | grep 192.168.1  # management alias
+
+# Cron loaded
+crontab -l
 
 # Connectivity
 curl -s --max-time 5 ifconfig.me && echo
@@ -410,16 +482,19 @@ Wait 2–3 minutes, SSH back in, and check:
 journalctl -u wpa_supplicant-wired@eth9.0 -b --no-pager | head -20
 journalctl -u on-boot.service -b --no-pager
 ip -br addr show eth9.0 eth9.962
+ip addr show eth9 | grep 192.168.1
+crontab -l
 curl -s --max-time 5 ifconfig.me && echo
 ```
 
 Expected timeline on a healthy boot:
 
 - T+0s — UDM boot
-- T+~15s — `on-boot.service` runs `10-eth9-vlan0.sh` (creates `eth9.0`) and `20-onu-ip.sh`
+- T+~15s — `on-boot.service` runs `10-eth9-vlan0.sh` (creates `eth9.0`), `20-onu-ip.sh` (adds management IP + SNAT), and `30-cron.sh` (restores crontab)
 - T+~20s — `wpa_supplicant-wired@eth9.0.service` starts cleanly (no "Dependency failed")
 - T+~45s — EAP-TLS auth succeeds, DHCP issues WAN IP
 - T+~60s — Internet fully restored
+- T+~60s — `eth9-watchdog.sh` fires for the first time via cron
 
 If you see `Dependency failed` in the journal, `10-eth9-vlan0.sh` did not run — check it's executable and that `on-boot.service` is enabled.
 
@@ -433,13 +508,17 @@ If you see `Dependency failed` in the journal, `10-eth9-vlan0.sh` did not run �
 
 **I2C bus lockup / all SFP ports disappear** — You have a Lantiq-based stick inserted. Replace with the DFP-34X-2C2. See compatibility warning at the top.
 
-**ONU management IP not accessible after reboot** — Check `journalctl -u on-boot.service -b` for `xtables lock` errors. Ensure the `-w` flag is present in `20-onu-ip.sh`.
+**ONU management IP not accessible after reboot** — Check `journalctl -u on-boot.service -b` for `xtables lock` errors. Ensure the `-w` flag is present in `20-onu-ip.sh`. Check `cat /var/log/eth9-watchdog.log` to see if the watchdog has been restoring it.
+
+**ONU management IP disappears mid-session** — `ubios-udapi-server` restarted and flushed interface state. The `eth9-watchdog.sh` cron will restore it within 60 seconds. Check `/var/log/eth9-watchdog.log` for timestamps.
 
 **wpa_supplicant fails to start after firmware update** — `reinstall-wpa.service` should handle this. Check `journalctl -u reinstall-wpa.service` for errors. Verify cached `.debs` still exist in `/etc/wpa_supplicant/packages/`.
 
-**No WAN IP after EAP-SUCCESS** — VLAN 962 is not enabled on the SFP+ WAN in the UniFi UI. See Step 10.
+**No WAN IP after EAP-SUCCESS** — VLAN 962 is not enabled on the SFP+ WAN in the UniFi UI. See Step 11.
 
 **EAP times out on first auth after cutover** — AT&T's OLT may hold stale registration from the BGW. Pull fiber from the stick, wait 60 seconds, reinsert.
+
+**Cron not running after reboot** — `/data/on_boot.d/30-cron.sh` is missing or not executable. Verify with `crontab -l` after boot; if empty, run `crontab /data/crontabs/root` manually and check `30-cron.sh` permissions.
 
 ---
 
@@ -463,10 +542,16 @@ Final list of files created during this guide:
         ├── wpasupplicant_*_arm64.deb
         └── libpcsclite1_*_arm64.deb
 
+/usr/local/bin/
+└── eth9-watchdog.sh
+
 /data/
+├── crontabs/
+│   └── root
 └── on_boot.d/
     ├── 10-eth9-vlan0.sh
-    └── 20-onu-ip.sh
+    ├── 20-onu-ip.sh
+    └── 30-cron.sh
 ```
 
 ---
