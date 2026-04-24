@@ -266,7 +266,7 @@ cat > /data/on_boot.d/20-onu-ip.sh << 'EOF'
 # Add ONU management IP to eth9 for 192.168.1.1 access
 for i in $(seq 1 30); do
     if ip link show eth9 | grep -q "state UP"; then
-        ifconfig eth9:2 192.168.1.2 netmask 255.255.255.0 up 2>/dev/null
+        ip addr add 192.168.1.2/24 dev eth9 2>/dev/null
         if ! iptables -w -t nat -C POSTROUTING -o eth9 -d 192.168.1.1 -j SNAT --to 192.168.1.2 2>/dev/null; then
             iptables -w -t nat -A POSTROUTING -o eth9 -d 192.168.1.1 -j SNAT --to 192.168.1.2
         fi
@@ -279,6 +279,8 @@ chmod +x /data/on_boot.d/20-onu-ip.sh
 ```
 
 > **Note:** The `-w` flag on iptables is required. Without it the rule silently fails at boot because UniFi's firewall initialization holds the xtables lock when `on_boot.d` scripts run.
+>
+> **Note:** `ip addr add` is used instead of `ifconfig eth9:2` because the alias interface form (`eth9:2`) is visible to `ubios-udapi-server`'s interface reconciliation logic and gets periodically torn down. Adding the address directly to `eth9` is more resilient.
 
 After applying, the stick is reachable at `http://192.168.1.1` and via SSH from the UDM.
 
@@ -286,7 +288,7 @@ After applying, the stick is reachable at `http://192.168.1.1` and via SSH from 
 
 ## Step 9 — ONU Management IP Watchdog
 
-UniFi OS's `ubios-udapi-server` occasionally restarts and flushes interface state, which can cause the `192.168.1.2` alias and iptables SNAT rule created in Step 8 to disappear between reboots. This watchdog detects and restores them automatically every minute.
+UniFi OS's `ubios-udapi-server` occasionally restarts and flushes interface state, which can cause the `192.168.1.2` address and iptables SNAT rule created in Step 8 to disappear between reboots. This watchdog detects and restores them automatically every minute.
 
 Create the watchdog script:
 
@@ -295,20 +297,12 @@ cat > /usr/local/bin/eth9-watchdog.sh << 'EOF'
 #!/bin/sh
 # Watchdog: restore eth9 ONU management IP and iptables SNAT rule if missing
 
-LOGFILE="/var/log/eth9-watchdog.log"
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOGFILE"
-}
-
-# Check and restore the 192.168.1.2 alias
-if ! ip addr show eth9 | grep -q '192.168.1.2'; then
-    log "192.168.1.2 missing from eth9 — restoring alias and SNAT rule"
-    ifconfig eth9:2 192.168.1.2 netmask 255.255.255.0 up 2>/dev/null
+if ! ip addr show eth9 2>/dev/null | grep -q '192.168.1.2'; then
+    logger -t eth9-watchdog "eth9 alias missing, restoring"
+    ip addr add 192.168.1.2/24 dev eth9 2>/dev/null
     if ! iptables -w -t nat -C POSTROUTING -o eth9 -d 192.168.1.1 -j SNAT --to 192.168.1.2 2>/dev/null; then
         iptables -w -t nat -A POSTROUTING -o eth9 -d 192.168.1.1 -j SNAT --to 192.168.1.2
     fi
-    log "Restored 192.168.1.2 alias and SNAT rule on eth9"
 fi
 EOF
 chmod +x /usr/local/bin/eth9-watchdog.sh
@@ -343,13 +337,13 @@ EOF
 chmod +x /data/on_boot.d/30-cron.sh
 ```
 
-After a minute, verify the watchdog is firing correctly (no output means the alias is present and healthy):
+Verify the watchdog is firing by checking syslog (restores are logged, healthy runs are silent):
 
 ```bash
-grep eth9-watchdog /var/log/eth9-watchdog.log
+grep eth9-watchdog /var/log/messages | tail -10
+# or
+journalctl -t eth9-watchdog --no-pager | tail -10
 ```
-
-> **Graylog / syslog users:** The watchdog logs to `/var/log/eth9-watchdog.log`. If you want a syslog-visible alert for Graylog, add `| logger -t eth9-watchdog` to the `log()` function's `echo` command.
 
 ---
 
@@ -437,7 +431,7 @@ systemctl is-active wpa_supplicant-wired@eth9.0
 # Three interfaces should have addresses
 ip -br addr show eth9.0        # UP, LOWER_UP
 ip -br addr show eth9.962      # has public IPv4 + IPv6
-ip addr show eth9 | grep 192.168.1  # management alias
+ip addr show eth9 | grep 192.168.1  # management IP
 
 # Cron loaded
 crontab -l
@@ -508,9 +502,9 @@ If you see `Dependency failed` in the journal, `10-eth9-vlan0.sh` did not run �
 
 **I2C bus lockup / all SFP ports disappear** — You have a Lantiq-based stick inserted. Replace with the DFP-34X-2C2. See compatibility warning at the top.
 
-**ONU management IP not accessible after reboot** — Check `journalctl -u on-boot.service -b` for `xtables lock` errors. Ensure the `-w` flag is present in `20-onu-ip.sh`. Check `cat /var/log/eth9-watchdog.log` to see if the watchdog has been restoring it.
+**ONU management IP not accessible after reboot** — Check `journalctl -u on-boot.service -b` for `xtables lock` errors. Ensure the `-w` flag is present in `20-onu-ip.sh`. Check `grep eth9-watchdog /var/log/messages` to see if the watchdog has been restoring it.
 
-**ONU management IP disappears mid-session** — `ubios-udapi-server` restarted and flushed interface state. The `eth9-watchdog.sh` cron will restore it within 60 seconds. Check `/var/log/eth9-watchdog.log` for timestamps.
+**ONU management IP disappears mid-session** — `ubios-udapi-server` restarted and flushed interface state. The `eth9-watchdog.sh` cron will restore it within 60 seconds. Check `grep eth9-watchdog /var/log/messages` for restore timestamps.
 
 **wpa_supplicant fails to start after firmware update** — `reinstall-wpa.service` should handle this. Check `journalctl -u reinstall-wpa.service` for errors. Verify cached `.debs` still exist in `/etc/wpa_supplicant/packages/`.
 
