@@ -111,11 +111,11 @@ ls /lib/systemd/system/wpa_supplicant-wired@.service
 # Cache packages for firmware-update survival
 mkdir -p /etc/wpa_supplicant/packages
 cd /etc/wpa_supplicant/packages
-wget http://security.debian.org/debian-security/pool/updates/main/w/wpa/wpasupplicant_2.9.0-21+deb11u3_arm64.deb
-wget http://ftp.us.debian.org/debian/pool/main/p/pcsc-lite/libpcsclite1_1.9.1-1_arm64.deb
+wget https://deb.debian.org/debian/pool/main/w/wpa/wpasupplicant_2.10-24_arm64.deb
+wget https://deb.debian.org/debian/pool/main/p/pcsc-lite/libpcsclite1_2.3.3-1_arm64.deb
 ```
 
-> **Note:** Package versions above are for Debian bullseye (UniFi OS 3.x/4.x on UDM Pro Max). If UniFi OS ships a newer Debian base in the future, substitute the latest `arm64` package URLs from `packages.debian.org`.
+> **Note:** The package versions above are for Debian 13 (trixie), which current UniFi OS 5.x is based on. Check yours with `head -3 /etc/os-release`. The cached `.deb` files must match the Debian release UniFi OS is running: a package built for an older release can fail with missing dependencies (for example `libssl1.1`) and `reinstall-wpa.service` will give up. If UniFi OS moves to a newer Debian base, replace the files in `/etc/wpa_supplicant/packages/` with that release's `arm64` builds from `packages.debian.org`. Keep exactly one `wpasupplicant` `.deb` in that folder, because `dpkg -Ri` installs everything in it.
 
 ---
 
@@ -145,6 +145,8 @@ eapol_version=1
 ap_scan=0
 fast_reauth=1
 
+openssl_ciphers=DEFAULT@SECLEVEL=0
+
 network={
     key_mgmt=IEEE8021X
     eap=TLS
@@ -157,6 +159,8 @@ network={
 EOF
 chmod 600 /etc/wpa_supplicant/wpa_supplicant-wired-eth9.0.conf
 ```
+
+> **Why `openssl_ciphers=DEFAULT@SECLEVEL=0`?** The BGW-derived client certificate uses a 1024-bit RSA key and SHA-1 signatures. OpenSSL 3.x (Debian 13) rejects both at its default security level, and without this line EAP-TLS fails with `Failed to initialize SSL`. Older Debian 11 builds (OpenSSL 1.1.1) accepted these certs without it.
 
 ---
 
@@ -288,60 +292,79 @@ After applying, the stick is reachable at `http://192.168.1.1` and via SSH from 
 
 ## Step 9 — ONU Management IP Watchdog
 
-UniFi OS's `ubios-udapi-server` occasionally restarts and flushes interface state, which can cause the `192.168.1.2` address and iptables SNAT rule created in Step 8 to disappear between reboots. This watchdog detects and restores them automatically every minute.
+UniFi OS's `ubios-udapi-server` and link flaps (including wpa_supplicant re-authentication) can flush the `192.168.1.2` address and the iptables SNAT rule created in Step 8. This watchdog restores them automatically, checking every 30 seconds.
+
+It runs as a systemd service, not cron, and its files live under `/data` because UniFi OS upgrades wipe `/usr/local/bin` and `/etc/systemd/system`. The unit is stored in `/data/systemd/` and copied back into place on every boot by an `on_boot.d` script.
 
 Create the watchdog script:
 
 ```bash
-cat > /usr/local/bin/eth9-watchdog.sh << 'EOF'
-#!/bin/sh
-# Watchdog: restore eth9 ONU management IP and iptables SNAT rule if missing
+mkdir -p /data/scripts /data/systemd
 
-if ! ip addr show eth9 2>/dev/null | grep -q '192.168.1.2'; then
-    logger -t eth9-watchdog "eth9 alias missing, restoring"
-    ip addr add 192.168.1.2/24 dev eth9 2>/dev/null
-    if ! iptables -w -t nat -C POSTROUTING -o eth9 -d 192.168.1.1 -j SNAT --to 192.168.1.2 2>/dev/null; then
-        iptables -w -t nat -A POSTROUTING -o eth9 -d 192.168.1.1 -j SNAT --to 192.168.1.2
+cat > /data/scripts/eth9-watchdog.sh << 'EOF'
+#!/bin/sh
+# Keep 192.168.1.2/24 on eth9 and the ONU SNAT rule in place.
+# Both get flushed by link flaps and wpa_supplicant re-auth.
+while true; do
+    if ip link show eth9 2>/dev/null | grep -q "state UP"; then
+        if ! ip addr show dev eth9 | grep -q "192.168.1.2/24"; then
+            ip addr add 192.168.1.2/24 dev eth9 2>/dev/null
+            logger -t eth9-watchdog "re-added 192.168.1.2/24 to eth9"
+        fi
+        if ! iptables -w -t nat -C POSTROUTING -o eth9 -d 192.168.1.1 \
+             -j SNAT --to 192.168.1.2 2>/dev/null; then
+            iptables -w -t nat -A POSTROUTING -o eth9 -d 192.168.1.1 \
+                     -j SNAT --to 192.168.1.2
+            logger -t eth9-watchdog "re-added ONU SNAT rule"
+        fi
     fi
-fi
+    sleep 30
+done
 EOF
-chmod +x /usr/local/bin/eth9-watchdog.sh
+chmod +x /data/scripts/eth9-watchdog.sh
 ```
 
-Set up the persistent cron entry. UniFi OS does not persist `crontab -e` across reboots — cron state must be stored in `/data/crontabs/root` and reloaded at boot:
+Create the unit file and store it in `/data/systemd/`:
 
 ```bash
-mkdir -p /data/crontabs
+cat > /data/systemd/eth9-watchdog.service << 'EOF'
+[Unit]
+Description=eth9 ONU IP watchdog
+After=network-online.target
 
-cat > /data/crontabs/root << 'EOF'
-* * * * * /usr/local/bin/eth9-watchdog.sh
+[Service]
+Type=simple
+ExecStart=/data/scripts/eth9-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
 EOF
-
-chmod 600 /data/crontabs/root
-crontab /data/crontabs/root
-
-# Verify it loaded
-crontab -l
 ```
 
-Create the boot script to restore cron on every reboot:
+Create the boot script that reinstalls and enables the unit on every boot:
 
 ```bash
-cat > /data/on_boot.d/30-cron.sh << 'EOF'
+cat > /data/on_boot.d/40-watchdog.sh << 'EOF'
 #!/bin/sh
-# Restore persistent crontab on boot
-if [ -f /data/crontabs/root ]; then
-    crontab /data/crontabs/root
-fi
+# Reinstall the eth9 watchdog unit; /etc/systemd/system does not
+# survive UniFi OS upgrades.
+[ -f /data/systemd/eth9-watchdog.service ] || exit 0
+cp /data/systemd/eth9-watchdog.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now eth9-watchdog.service
 EOF
-chmod +x /data/on_boot.d/30-cron.sh
+chmod +x /data/on_boot.d/40-watchdog.sh
+
+# Start it now without waiting for a reboot
+/data/on_boot.d/40-watchdog.sh
 ```
 
-Verify the watchdog is firing by checking syslog (restores are logged, healthy runs are silent):
+Verify the watchdog is running (restores are logged, healthy loops are silent):
 
 ```bash
-grep eth9-watchdog /var/log/messages | tail -10
-# or
+systemctl status eth9-watchdog --no-pager
 journalctl -t eth9-watchdog --no-pager | tail -10
 ```
 
@@ -413,6 +436,8 @@ Apply the change. WAN will be offline until you complete the fiber swap below.
    watch -n 1 'ip -br addr show eth9.0; ip -br addr show eth9.962; ip route show default'
    ```
 
+> A single `EAP-FAILURE` followed by `EAP-SUCCESS` within a second or two is normal; the supplicant retries until the OLT accepts.
+
 You should see `CTRL-EVENT-EAP-SUCCESS` followed by `CTRL-EVENT-CONNECTED` within ~60 seconds, and a public IP on `eth9.962` shortly after via DHCP.
 
 ---
@@ -428,13 +453,13 @@ systemctl is-enabled wpa_supplicant-wired@eth9.0 on-boot.service reinstall-wpa.s
 # Supplicant should be active
 systemctl is-active wpa_supplicant-wired@eth9.0
 
+# Watchdog should be active
+systemctl is-active eth9-watchdog
+
 # Three interfaces should have addresses
 ip -br addr show eth9.0        # UP, LOWER_UP
 ip -br addr show eth9.962      # has public IPv4 + IPv6
 ip addr show eth9 | grep 192.168.1  # management IP
-
-# Cron loaded
-crontab -l
 
 # Connectivity
 curl -s --max-time 5 ifconfig.me && echo
@@ -450,7 +475,7 @@ pgrep -af wpa_supplicant
 Expected (plus the system-wide dbus instance which is unrelated):
 
 ```
-/sbin/wpa_supplicant -c/etc/wpa_supplicant/wpa_supplicant-wired-eth9.0.conf -Dwired -ieth9.0
+/usr/sbin/wpa_supplicant -c/etc/wpa_supplicant/wpa_supplicant-wired-eth9.0.conf -Dwired -ieth9.0
 ```
 
 GPON state on the stick (SSH to 192.168.1.1):
@@ -477,18 +502,17 @@ journalctl -u wpa_supplicant-wired@eth9.0 -b --no-pager | head -20
 journalctl -u on-boot.service -b --no-pager
 ip -br addr show eth9.0 eth9.962
 ip addr show eth9 | grep 192.168.1
-crontab -l
+systemctl is-active eth9-watchdog
 curl -s --max-time 5 ifconfig.me && echo
 ```
 
 Expected timeline on a healthy boot:
 
 - T+0s — UDM boot
-- T+~15s — `on-boot.service` runs `10-eth9-vlan0.sh` (creates `eth9.0`), `20-onu-ip.sh` (adds management IP + SNAT), and `30-cron.sh` (restores crontab)
+- T+~15s — `on-boot.service` runs `10-eth9-vlan0.sh` (creates `eth9.0`), `20-onu-ip.sh` (adds management IP + SNAT), and `40-watchdog.sh` (reinstalls and starts the watchdog service)
 - T+~20s — `wpa_supplicant-wired@eth9.0.service` starts cleanly (no "Dependency failed")
 - T+~45s — EAP-TLS auth succeeds, DHCP issues WAN IP
 - T+~60s — Internet fully restored
-- T+~60s — `eth9-watchdog.sh` fires for the first time via cron
 
 If you see `Dependency failed` in the journal, `10-eth9-vlan0.sh` did not run — check it's executable and that `on-boot.service` is enabled.
 
@@ -502,9 +526,9 @@ If you see `Dependency failed` in the journal, `10-eth9-vlan0.sh` did not run �
 
 **I2C bus lockup / all SFP ports disappear** — You have a Lantiq-based stick inserted. Replace with the DFP-34X-2C2. See compatibility warning at the top.
 
-**ONU management IP not accessible after reboot** — Check `journalctl -u on-boot.service -b` for `xtables lock` errors. Ensure the `-w` flag is present in `20-onu-ip.sh`. Check `grep eth9-watchdog /var/log/messages` to see if the watchdog has been restoring it.
+**ONU management IP not accessible after reboot** — Check `journalctl -u on-boot.service -b` for `xtables lock` errors. Ensure the `-w` flag is present in `20-onu-ip.sh`. Check `journalctl -t eth9-watchdog --no-pager | tail` to see if the watchdog has been restoring it.
 
-**ONU management IP disappears mid-session** — `ubios-udapi-server` restarted and flushed interface state. The `eth9-watchdog.sh` cron will restore it within 60 seconds. Check `grep eth9-watchdog /var/log/messages` for restore timestamps.
+**ONU management IP disappears mid-session** — A link flap, wpa_supplicant re-auth, or a `ubios-udapi-server` restart flushed interface state. The watchdog restores it within 30 seconds. Check `journalctl -t eth9-watchdog --no-pager | tail` for restore timestamps and `systemctl status eth9-watchdog` to confirm it's running.
 
 **wpa_supplicant fails to start after firmware update** — `reinstall-wpa.service` should handle this. Check `journalctl -u reinstall-wpa.service` for errors. Verify cached `.debs` still exist in `/etc/wpa_supplicant/packages/`.
 
@@ -512,7 +536,11 @@ If you see `Dependency failed` in the journal, `10-eth9-vlan0.sh` did not run �
 
 **EAP times out on first auth after cutover** — AT&T's OLT may hold stale registration from the BGW. Pull fiber from the stick, wait 60 seconds, reinsert.
 
-**Cron not running after reboot** — `/data/on_boot.d/30-cron.sh` is missing or not executable. Verify with `crontab -l` after boot; if empty, run `crontab /data/crontabs/root` manually and check `30-cron.sh` permissions.
+**Watchdog not running after reboot or firmware update** — `/etc/systemd/system/eth9-watchdog.service` was wiped by the upgrade. `/data/on_boot.d/40-watchdog.sh` copies it back from `/data/systemd/` at boot, so check that the script is executable and `on-boot.service` is enabled. You can run `/data/on_boot.d/40-watchdog.sh` by hand to restore it.
+
+**No WAN after a firmware update; `dpkg -l wpasupplicant` shows `rc`** — The update removed the package. Check `journalctl -u reinstall-wpa -b`. A `libssl1.1` dependency error means the cached `.deb` is for an older Debian release than UniFi OS now uses; replace it with the current release's build (see the Step 3 note).
+
+**`EAP-TLS: Failed to initialize SSL` and "Private key passphrase needed"** — Add `openssl_ciphers=DEFAULT@SECLEVEL=0` to the config (Step 4) and restart the service. The passphrase prompt is a misleading side effect; the key itself is fine.
 
 ---
 
@@ -525,6 +553,7 @@ Final list of files created during this guide:
 ├── systemd/system/
 │   ├── on-boot.service
 │   ├── reinstall-wpa.service
+│   ├── eth9-watchdog.service          (copied from /data/systemd at boot)
 │   └── wpa_supplicant-wired@eth9.0.service.d/
 │       └── vlan0.conf
 └── wpa_supplicant/
@@ -536,16 +565,15 @@ Final list of files created during this guide:
         ├── wpasupplicant_*_arm64.deb
         └── libpcsclite1_*_arm64.deb
 
-/usr/local/bin/
-└── eth9-watchdog.sh
-
 /data/
-├── crontabs/
-│   └── root
+├── scripts/
+│   └── eth9-watchdog.sh
+├── systemd/
+│   └── eth9-watchdog.service
 └── on_boot.d/
     ├── 10-eth9-vlan0.sh
     ├── 20-onu-ip.sh
-    └── 30-cron.sh
+    └── 40-watchdog.sh
 ```
 
 ---
